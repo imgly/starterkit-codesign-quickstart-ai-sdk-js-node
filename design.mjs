@@ -1,0 +1,180 @@
+// A brief in, a finished design out: the Vercel AI SDK runs the model through IMG.LY's gateway, the engine runs in one local executor.
+import { mkdir, writeFile } from 'node:fs/promises';
+
+import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
+import {
+  googleFonts,
+  prepareCoDesign,
+  remoteExecutors
+} from '@imgly/codesign-sdk';
+import { generateText, isStepCount, jsonSchema } from 'ai';
+
+const brief = process.argv[2];
+const missing = [
+  ...(brief ? [] : ['a brief (the first argument)']),
+  ...['IMGLY_CESDK_LICENSE', 'EXECUTOR_TOKEN'].filter((n) => !process.env[n])
+];
+if (missing.length > 0) {
+  console.error(
+    `Missing ${missing.join(', ')}.\nUsage: npm start -- "<brief>", with the variables of .env.template set in .env`
+  );
+  process.exit(1);
+}
+
+// IMG.LY's AI gateway speaks OpenAI's Chat Completions; your CoDesign license key is its API key.
+const imglyGateway = createOpenAICompatible({
+  name: 'imgly',
+  baseURL: 'https://gateway.img.ly/v1',
+  apiKey: process.env.IMGLY_CESDK_LICENSE
+});
+
+const codesign = prepareCoDesign({
+  // Your id for this job. Every design of a conversation opens on one executor
+  // that serves no other conversation. Every run here is yours, so all share one.
+  conversation: 'quickstart',
+  executors: remoteExecutors({
+    // The executor for a conversation. Here there is one; a product starts a
+    // new one for each conversation.
+    acquire: () => ({
+      url: process.env.EXECUTOR_URL || 'http://localhost:8080'
+    }),
+    token: process.env.EXECUTOR_TOKEN
+  }),
+  // The CE.SDK plugins the engine applies: everything the agent can search and
+  // place. Google Fonts is the smallest useful list; your own plugins go here.
+  plugins: [googleFonts()],
+  design: `quickstart-${Date.now()}`, // any id; with no `designs` store, the design lives in memory
+  gateway: false // no image generation; the model still runs through the gateway
+});
+
+const textOf = (parts) =>
+  parts
+    .map((p) => (p.type === 'text' ? p.text : ''))
+    .join('\n')
+    .trim();
+
+// The SDK's tools in the AI SDK's shape.
+/** @type {import('ai').ToolSet} */
+const tools = Object.fromEntries(
+  codesign.tools.map((t) => [
+    t.name,
+    {
+      description: t.description,
+      inputSchema: jsonSchema(t.inputSchema),
+      execute: async (args, { abortSignal }) => {
+        const result = await t.call(args, { signal: abortSignal });
+        console.log(`${result.isError ? '✗' : '✓'} ${t.name}`);
+        if (result.isError) throw new Error(textOf(result.content)); // the model reads it as a failed call
+        return result.content;
+      },
+      toModelOutput: ({ output }) => ({
+        type: /** @type {const} */ ('content'),
+        value: output.map((p) =>
+          p.type === 'text'
+            ? { type: /** @type {const} */ ('text'), text: p.text }
+            : {
+                type: /** @type {const} */ ('file'),
+                mediaType: p.mimeType,
+                data: { type: /** @type {const} */ ('data'), data: p.data }
+              }
+        )
+      })
+    }
+  ])
+);
+
+// Chat Completions has no images in a tool result: move each render into a
+// user message after it, so the model sees its work. Left out, nothing fails;
+// the model designs blind.
+function imagesAfterToolResults(messages) {
+  const out = [];
+  let images = [];
+  const flush = () => {
+    if (images.length === 0) return;
+    out.push({
+      role: 'user',
+      content: [
+        {
+          type: /** @type {const} */ ('text'),
+          text: 'Attached image(s) from tool result:'
+        },
+        ...images
+      ]
+    });
+    images = [];
+  };
+  for (const message of messages) {
+    if (message.role !== 'tool') {
+      flush();
+      out.push(message);
+      continue;
+    }
+    out.push({
+      ...message,
+      content: message.content.map((part) => {
+        if (part.type !== 'tool-result' || part.output.type !== 'content')
+          return part;
+        const isImage = (item) =>
+          item.type === 'file' && item.mediaType.startsWith('image');
+        const kept = part.output.value.filter((item) => !isImage(item));
+        if (kept.length === part.output.value.length) return part;
+        for (const item of part.output.value.filter(isImage)) {
+          images.push({
+            type: /** @type {const} */ ('file'),
+            mediaType: item.mediaType,
+            data: item.data
+          });
+        }
+        return {
+          ...part,
+          output: {
+            type: /** @type {const} */ ('content'),
+            value:
+              kept.length > 0
+                ? kept
+                : [
+                    {
+                      type: /** @type {const} */ ('text'),
+                      text: '(see attached image)'
+                    }
+                  ]
+          }
+        };
+      })
+    });
+  }
+  flush();
+  return out;
+}
+
+const started = Date.now();
+const run = await generateText({
+  model: imglyGateway(
+    process.env.MODEL || '@openrouter/anthropic/claude-opus-5'
+  ),
+  instructions: `You design marketing visuals. When you are done, say in one sentence what you made.\n\n${codesign.instructions}`,
+  tools,
+  prepareStep: ({ messages }) => ({
+    messages: imagesAfterToolResults(messages)
+  }),
+  stopWhen: isStepCount(60), // without it, the run ends after the first tool call
+  prompt: brief
+});
+console.log(`\n${run.text}`);
+const { inputTokens, outputTokens } = run.totalUsage ?? {};
+console.log(
+  `${run.steps.length} steps, ${Math.round((Date.now() - started) / 1000)} s, ` +
+    `${inputTokens ?? '?'} input / ${outputTokens ?? '?'} output tokens`
+);
+if (run.finishReason !== 'stop') {
+  console.error(
+    `The model stopped early (${run.finishReason}); nothing exported.`
+  );
+  process.exitCode = 1;
+} else {
+  await mkdir('out', { recursive: true });
+  await writeFile('out/design.png', await codesign.export('png'));
+  await writeFile('out/design.imgly', await codesign.export('imgly'));
+  console.log('Wrote out/design.png and out/design.imgly');
+}
+await codesign.release(); // ends the design's session now; the engine closes about 30 s later
