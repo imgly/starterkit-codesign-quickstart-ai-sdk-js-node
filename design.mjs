@@ -65,7 +65,12 @@ const tools = Object.fromEntries(
       description: t.description,
       inputSchema: jsonSchema(t.inputSchema),
       execute: async (args, { abortSignal }) => {
-        const result = await t.call(args, { signal: abortSignal });
+        const result = await t
+          .call(args, { signal: abortSignal })
+          .catch((err) => {
+            console.log(`✗ ${t.name} (${err.kind ?? err.name})`); // rejected: the executor or your store failed
+            throw err;
+          });
         console.log(`${result.isError ? '✗' : '✓'} ${t.name}`);
         if (result.isError) throw new Error(textOf(result.content)); // the model reads it as a failed call
         return result.content;
@@ -150,34 +155,55 @@ function imagesAfterToolResults(messages) {
   return out;
 }
 
-const started = Date.now();
-const run = await generateText({
-  model: imglyGateway(
-    process.env.MODEL || '@openrouter/anthropic/claude-opus-5'
-  ),
-  instructions: `You design marketing visuals. When you are done, say in one sentence what you made.\n\n${codesign.instructions}`,
-  tools,
-  prepareStep: ({ messages }) => ({
-    messages: imagesAfterToolResults(messages)
-  }),
-  stopWhen: isStepCount(60), // without it, the run ends after the first tool call
-  prompt: brief
-});
-console.log(`\n${run.text}`);
-const { inputTokens, outputTokens } = run.totalUsage ?? {};
-console.log(
-  `${run.steps.length} steps, ${Math.round((Date.now() - started) / 1000)} s, ` +
-    `${inputTokens ?? '?'} input / ${outputTokens ?? '?'} output tokens`
-);
-if (run.finishReason !== 'stop') {
-  console.error(
-    `The model stopped early (${run.finishReason}); nothing exported.`
-  );
-  process.exitCode = 1;
-} else {
-  await mkdir('out', { recursive: true });
-  await writeFile('out/design.png', await codesign.export('png'));
-  await writeFile('out/design.imgly', await codesign.export('imgly'));
-  console.log('Wrote out/design.png and out/design.imgly');
+/** A failure in one line: the SDK error's kind and the first line of its message, not a stack or a request body. */
+const cause = (err) =>
+  `${err?.kind ? `${err.kind}: ` : ''}${String(err instanceof Error ? err.message : err).split('\n')[0]}`;
+
+// The free .imgly first: when the billed PNG export fails, or the run ends early, the design the model made is kept.
+async function save(withPNG) {
+  let file = 'out/design.imgly';
+  try {
+    await mkdir('out', { recursive: true });
+    await writeFile(file, await codesign.export('imgly'));
+    if (!withPNG) return console.error(`Wrote ${file}, the design so far.`);
+    file = 'out/design.png';
+    await writeFile(file, await codesign.export('png'));
+    console.log('Wrote out/design.png and out/design.imgly');
+  } catch (err) {
+    console.error(`Could not write ${file}: ${cause(err)}`);
+    process.exitCode = 1;
+  }
 }
-await codesign.release(); // ends the design's session now; the engine closes about 30 s later
+
+const started = Date.now();
+try {
+  const run = await generateText({
+    model: imglyGateway(
+      process.env.MODEL || '@openrouter/anthropic/claude-opus-5'
+    ),
+    instructions: `You design marketing visuals. When you are done, say in one sentence what you made.\n\n${codesign.instructions}`,
+    tools,
+    prepareStep: ({ messages }) => ({
+      messages: imagesAfterToolResults(messages)
+    }),
+    stopWhen: isStepCount(60), // without it, the run ends after the first tool call
+    prompt: brief
+  });
+  console.log(`\n${run.text}`);
+  const { inputTokens, outputTokens } = run.totalUsage ?? {};
+  console.log(
+    `${run.steps.length} steps, ${Math.round((Date.now() - started) / 1000)} s, ` +
+      `${inputTokens ?? '?'} input / ${outputTokens ?? '?'} output tokens`
+  );
+  if (run.finishReason !== 'stop') {
+    console.error(`The model stopped early (${run.finishReason}).`);
+    process.exitCode = 1;
+  }
+  await save(run.finishReason === 'stop');
+} catch (err) {
+  console.error(`The run failed: ${cause(err)}`);
+  process.exitCode = 1;
+  await save(false);
+} finally {
+  await codesign.release(); // ends the design's session now; the engine closes about 30 s later
+}
